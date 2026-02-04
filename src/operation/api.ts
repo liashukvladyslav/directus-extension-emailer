@@ -1,17 +1,20 @@
 import { defineOperationApi } from "@directus/extensions-sdk";
 
+type MaybeArray<T> = T | T[];
+
 export type Options = {
-	to: string;
-	type: 'wysiwyg' | 'markdown' | 'template';
-  attachments?: string;
-  files?: string;
-	subject: string;
-	body?: string;
-	template?: string;
-	data?: Record<string, any>;
-	cc?: string;
-	bcc?: string;
-	replyTo?: string;
+  to: MaybeArray<string>;
+  type: "wysiwyg" | "markdown" | "template";
+  subject: string;
+  body?: string;
+  template?: string;
+  data?: Record<string, any>;
+  cc?: MaybeArray<string>;
+  bcc?: MaybeArray<string>;
+  replyTo?: MaybeArray<string>;
+  from?: string;
+  attachments?: any[];
+  files?: string | string[];
 };
 
 // ...existing code...
@@ -21,46 +24,35 @@ export default defineOperationApi<Options>({
 
     console.log("Executing emailer operation with options:", options);
 
+    // Normalize files to string[]
     let fileIds: string[] = [];
-    if (options.files && typeof options.files === 'string') {
-      // Assuming files is a comma-separated string of file IDs
-      fileIds = options.files.split(',').map(id => id.trim()).filter(id => id);
+    const rawFiles = options.files;
+
+    if (Array.isArray(rawFiles)) {
+      fileIds = rawFiles.map(String).map(s => s.trim()).filter(Boolean);
+    } else if (typeof rawFiles === "string") {
+      // allow comma-separated string
+      fileIds = rawFiles.split(",").map(s => s.trim()).filter(Boolean);
     }
 
-    // Construct payload based on what the endpoint `index.ts` actually consumes
-    const endpointPayload: {
-      to: string;
-      subject: string;
-      template?: {
-        name: string;
-        data?: Record<string, any>;
-      },
-      attachments?: string;
-      files?: string[];
-     body?: string;
-      cc?: string;
-      bcc?: string;
-      replyTo?: string;
-      // The endpoint also accepts 'list' and 'attachments' (pre-formatted array),
-      // but these are not directly available or in the correct format from `options`.
-    } = {
+		// Construct payload based on what the endpoint `index.ts` actually consumes
+    const endpointPayload: any = {
       to: options.to,
       subject: options.subject,
       cc: options.cc,
       bcc: options.bcc,
       replyTo: options.replyTo,
+      from: options.from,
     };
 
-    if (options.type === 'template' && options.template) {
-      endpointPayload.template = {
-      name: options.template,
-      data: options.data,
-	  };
-    } else if ((options.type === 'wysiwyg') && options.body) {
+    if (options.type === "template" && options.template) {
+      endpointPayload.template = { name: options.template, data: options.data };
+    } else if (options.body) {
       endpointPayload.body = options.body;
+      endpointPayload.type = options.type;
     }
 
-    if (options.attachments) {
+    if (options.attachments && Array.isArray(options.attachments) && options.attachments.length > 0) {
       endpointPayload.attachments = options.attachments;
     }
 
@@ -68,43 +60,35 @@ export default defineOperationApi<Options>({
       endpointPayload.files = fileIds;
     }
 
-    // Properties like cc, bcc, replyTo are in Options but not handled by the endpoint's `create` function.
+		// Properties like cc, bcc, replyTo are in Options but not handled by the endpoint's `create` function.
 
     // Remove undefined keys to keep payload clean, though `fetch` handles undefined fine.
-    Object.keys(endpointPayload).forEach(key => (endpointPayload as Record<string, any>)[key] === undefined && delete (endpointPayload as Record<string, any>)[key]);
+    Object.keys(endpointPayload).forEach(
+      k => endpointPayload[k] === undefined && delete endpointPayload[k]
+    );
 
     try {
       if (!env.EMAIL_ALLOW_GUEST_SEND && (!accountability || !accountability.user)) {
-        logger.warn("No authentication token found for calling the emailer endpoint. Sending may fail if guest sending is not allowed and the operation is not run by an authenticated user.");
+        logger.warn(
+          "No authentication token found for calling the emailer endpoint. Sending may fail if guest sending is not allowed and the operation is not run by an authenticated user."
+        );
       }
 
       logger.info(`Calling emailer function with payload: ${JSON.stringify(endpointPayload)}`);
 
-
       const result = await (globalThis as any).Emailer.sendEmail({
         accountability,
         schema: await getSchema(),
-        body: endpointPayload
+        body: endpointPayload,
       });
 
-      if (!result) {
-        logger.error(`Error calling emailer function: ${result.status} ${result.statusText}`);
-        throw new Error(`Failed to send email via function: ${result.statusText} (Status ${result.status})`);
-      }
+      if (!result) throw new Error("No result from Emailer.sendEmail");
 
       logger.info(`Email function responded with: "${result}"`);
-
-      // Operations don't typically return values that are used by other operations in a flow directly.
-      // Successful execution implies success. If specific output is needed, it can be returned.
       return { success: true };
-
     } catch (error: any) {
-      logger.error('Failed to call emailer function:', error);
-      // Ensure the error is re-thrown so the operation fails visibly in Directus
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(`Failed to send email due to an unexpected error: ${String(error)}`);
+      logger.error("Failed to call emailer function:", error);
+      throw error instanceof Error ? error : new Error(String(error));
     }
   },
 });
