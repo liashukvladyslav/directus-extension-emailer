@@ -1,94 +1,153 @@
-import { defineOperationApi } from "@directus/extensions-sdk";
+import { defineOperationApi } from '@directus/extensions-sdk';
+import { md } from '../utils/md';
+import type { MailMessage, Options } from '../utils/_types';
 
-type MaybeArray<T> = T | T[];
+type AnyObj = Record<string, any>;
 
-export type Options = {
-  to: MaybeArray<string>;
-  type: "wysiwyg" | "markdown" | "template";
-  subject: string;
-  body?: string;
-  template?: string;
-  data?: Record<string, any>;
-  cc?: MaybeArray<string>;
-  bcc?: MaybeArray<string>;
-  replyTo?: MaybeArray<string>;
-  from?: string;
-  attachments?: any[];
-  files?: string | string[];
-};
+function normalizeBool(v: any): boolean {
+  return v === true || String(v).toLowerCase() === 'true';
+}
 
-// ...existing code...
+function splitCsv(v: any): string[] {
+  return String(v ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function getAccountabilityRoles(acc: AnyObj | undefined): string[] {
+  if (!acc) return [];
+  const rolesArr = Array.isArray(acc.roles) ? acc.roles.map(String) : [];
+  const roleSingle = acc.role != null ? [String(acc.role)] : [];
+  return Array.from(new Set([...rolesArr, ...roleSingle]));
+}
+
+function getTokenFromOptions(options: AnyObj): string | null {
+  const t = options?.token ?? options?.authToken ?? options?.authorization;
+  if (!t) return null;
+  return String(t).replace(/^Bearer\s+/i, '').trim() || null;
+}
+
 export default defineOperationApi<Options>({
-  id: "emailer",
-  handler: async (options: Options, { env, logger, accountability, getSchema }) => {
+  id: 'emailer',
 
-    console.log("Executing emailer operation with options:", options);
+  handler: async (options: AnyObj, context: AnyObj) => {
+    const { services, env, getSchema, logger, accountability } = context;
 
-    // Normalize files to string[]
-    let fileIds: string[] = [];
-    const rawFiles = options.files;
+    const { MailService, AssetsService } = services;
 
-    if (Array.isArray(rawFiles)) {
-      fileIds = rawFiles.map(String).map(s => s.trim()).filter(Boolean);
-    } else if (typeof rawFiles === "string") {
-      // allow comma-separated string
-      fileIds = rawFiles.split(",").map(s => s.trim()).filter(Boolean);
-    }
+    const schema = await getSchema();
 
-		// Construct payload based on what the endpoint `index.ts` actually consumes
-    const endpointPayload: any = {
-      to: options.to,
-      subject: options.subject,
-      cc: options.cc,
-      bcc: options.bcc,
-      replyTo: options.replyTo,
-      from: options.from,
-    };
+    const mailService = new MailService({
+      accountability,
+      schema,
+    });
 
-    if (options.type === "template" && options.template) {
-      endpointPayload.template = { name: options.template, data: options.data };
-    } else if (options.body) {
-      endpointPayload.body = options.body;
-      endpointPayload.type = options.type;
-    }
+    const assetsService = new AssetsService({
+      accountability,
+      schema,
+    });
 
-    if (options.attachments && Array.isArray(options.attachments) && options.attachments.length > 0) {
-      endpointPayload.attachments = options.attachments;
-    }
+    const envAny: AnyObj = env || {};
+    const allowGuest = normalizeBool(envAny.EMAIL_ALLOW_GUEST_SEND ?? process.env.EMAIL_ALLOW_GUEST_SEND);
+    const allowedRoles = splitCsv(envAny.EMAIL_ALLOWED_ROLES ?? process.env.EMAIL_ALLOWED_ROLES);
+    const expectedToken = String(envAny.EMAILER_TOKEN ?? process.env.EMAILER_TOKEN ?? '').trim();
 
-    if (fileIds.length > 0) {
-      endpointPayload.files = fileIds;
-    }
+    const roles = getAccountabilityRoles(accountability);
 
-		// Properties like cc, bcc, replyTo are in Options but not handled by the endpoint's `create` function.
+    const gotToken = getTokenFromOptions(options);
+    const tokenOk = !!expectedToken && !!gotToken && gotToken === expectedToken;
 
-    // Remove undefined keys to keep payload clean, though `fetch` handles undefined fine.
-    Object.keys(endpointPayload).forEach(
-      k => endpointPayload[k] === undefined && delete endpointPayload[k]
+    const info = logger?.info ? (msg: any, label?: string) => logger.info(msg, label) : (msg: any, label?: string) => console.log(label ?? '', msg);
+    const error = logger?.error ? (msg: any, label?: string) => logger.error(msg, label) : (msg: any, label?: string) => console.error(label ?? '', msg);
+
+    info(
+      {
+        EMAIL_ALLOWED_ROLES_ctx: envAny.EMAIL_ALLOWED_ROLES,
+        EMAIL_ALLOWED_ROLES_proc: process.env.EMAIL_ALLOWED_ROLES,
+        allowGuest,
+        allowedRoles,
+        admin: !!accountability?.admin,
+        role: accountability?.role,
+        roles_raw: accountability?.roles,
+        roles_normalized: roles,
+        tokenOk,
+        expectedTokenSet: !!expectedToken,
+      },
+      '[emailer] auth debug'
     );
 
-    try {
-      if (!env.EMAIL_ALLOW_GUEST_SEND && (!accountability || !accountability.user)) {
-        logger.warn(
-          "No authentication token found for calling the emailer endpoint. Sending may fail if guest sending is not allowed and the operation is not run by an authenticated user."
-        );
+    const authorityOk =
+      tokenOk ||
+      allowGuest ||
+      accountability?.admin === true ||
+      (allowedRoles.length > 0 && roles.some((r) => allowedRoles.includes(r)));
+
+    if (!authorityOk) {
+      throw new Error('User not authorized, enable guest sending or include a token');
+    }
+
+    const getAttachments = async (fileIDs: any): Promise<any[]> => {
+      const ids = Array.isArray(fileIDs) ? fileIDs : [];
+      if (ids.length === 0) return [];
+
+      const settled = await Promise.allSettled(
+        ids.map((id) => assetsService.getAsset(id, { transformationParams: {} }))
+      );
+
+      const ok = settled.filter((x) => x.status === 'fulfilled') as PromiseFulfilledResult<any>[];
+
+      return ok.map((asset) => {
+        const { stream, file } = asset.value;
+        return {
+          contentType: file.type,
+          filename: file.filename_download,
+          content: stream,
+        };
+      });
+    };
+
+    const createEmailObject = async (payload: AnyObj): Promise<MailMessage> => {
+      const mail: MailMessage = {
+        to: payload.to,
+        subject: payload.subject,
+        attachments: payload.attachments || [],
+      };
+
+      if (payload.from) mail.from = payload.from;
+      if (payload.cc) mail.cc = payload.cc;
+      if (payload.bcc) mail.bcc = payload.bcc;
+      if (payload.replyTo) mail.replyTo = payload.replyTo;
+
+      const safeBody = typeof payload.body !== 'string' ? JSON.stringify(payload.body) : payload.body;
+
+      if (payload.type === 'template') {
+        mail.template = {
+          name: payload.template || 'base',
+          data: payload.data || {},
+        };
+      } else {
+        mail.html = payload.type === 'wysiwyg' ? safeBody : md(safeBody);
       }
 
-      logger.info(`Calling emailer function with payload: ${JSON.stringify(endpointPayload)}`);
+      if (!Array.isArray(mail.attachments)) mail.attachments = [];
 
-      const result = await (globalThis as any).Emailer.sendEmail({
-        accountability,
-        schema: await getSchema(),
-        body: endpointPayload,
-      });
+      if (Array.isArray(payload.files) && payload.files.length > 0) {
+        const fileAttachments = await getAttachments(payload.files);
+        mail.attachments = mail.attachments.concat(fileAttachments);
+      }
 
-      if (!result) throw new Error("No result from Emailer.sendEmail");
+      return mail;
+    };
 
-      logger.info(`Email function responded with: "${result}"`);
-      return { success: true };
-    } catch (error: any) {
-      logger.error("Failed to call emailer function:", error);
-      throw error instanceof Error ? error : new Error(String(error));
+    const emailObject = await createEmailObject(options);
+
+    try {
+      await mailService.send(emailObject);
+      return 'sent';
+    } catch (e: any) {
+      error(e, '[emailer] MailService.send error');
+      throw e;
     }
   },
 });

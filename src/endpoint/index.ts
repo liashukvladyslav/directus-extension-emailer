@@ -1,77 +1,89 @@
-import { OperationApiConfig } from '@directus/extensions';
-import { log } from 'directus:api';
+import type { OperationApiConfig } from '@directus/extensions';
 import { md } from '../utils/md';
-import { Attachment, MailMessage, Options, StreamAttachment } from '../utils/_types';
+import type { MailMessage, Options } from '../utils/_types';
+
+type AnyObj = Record<string, any>;
+
+function normalizeBool(v: any): boolean {
+  return v === true || String(v).toLowerCase() === 'true';
+}
+
+function splitCsv(v: any): string[] {
+  return String(v ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function getAccountabilityRoles(acc: AnyObj | undefined): string[] {
+  if (!acc) return [];
+  const rolesArr = Array.isArray(acc.roles) ? acc.roles.map(String) : [];
+  const roleSingle = acc.role != null ? [String(acc.role)] : [];
+  return Array.from(new Set([...rolesArr, ...roleSingle]));
+}
+
+function getTokenFromHeaders(req: any): string | null {
+  const auth = req?.headers?.authorization;
+  const x = req?.headers?.['x-emailer-token'];
+  const raw = (auth || x) ?? '';
+  const token = String(raw).replace(/^Bearer\s+/i, '').trim();
+  return token || null;
+}
 
 const config: OperationApiConfig<Options> = {
-  id: "emailer",
+  id: 'emailer',
   handler: (router, { services, env }) => {
     const { AssetsService, MailService } = services;
 
     (globalThis as any).Emailer = {
-      sendEmail: async (context: any) => {
-        const mailService = new MailService({
-          accountability: context.accountability,
-          schema: context.schema,
-        });
+      sendEmail: async (context: AnyObj) => {
+        const acc: AnyObj | undefined = context.accountability;
+        const schema = context.schema;
 
-        const assetsService = new AssetsService({
-          accountability: context.accountability,
-          schema: context.schema,
-        });
+        const mailService = new MailService({ accountability: acc, schema });
+        const assetsService = new AssetsService({ accountability: acc, schema });
 
-        const { body: emailPayload } = context;
+        const emailPayload = context.body;
 
-        const authorityCheck = () => {
-          if (env.EMAIL_ALLOW_GUEST_SEND === 'true' || env.EMAIL_ALLOW_GUEST_SEND === true) {
-            return true;
-          }
+        const allowGuest = normalizeBool(env.EMAIL_ALLOW_GUEST_SEND);
+        const allowedRoles = splitCsv(env.EMAIL_ALLOWED_ROLES);
+        const roles = getAccountabilityRoles(acc);
 
-          if (context.accountability && context.accountability.admin === true) {
-            return true;
-          }
+        const expectedToken = String(env.EMAILER_TOKEN ?? '').trim();
+        const gotToken = context?.token ? String(context.token).trim() : '';
+        const tokenOk = !!expectedToken && !!gotToken && gotToken === expectedToken;
 
-          if (context.accountability && context.accountability.roles && env.EMAIL_ALLOWED_ROLES) {
-            const allowedRoles = env.EMAIL_ALLOWED_ROLES.split(',');
-            if (allowedRoles.some(role => context.accountability.roles.includes(role))) {
-              return true;
-            }
-          }
-          
-          return false;
-        };
+        const authorityOk =
+          tokenOk ||
+          allowGuest ||
+          acc?.admin === true ||
+          (allowedRoles.length > 0 && roles.some((r) => allowedRoles.includes(r)));
 
-        const getAttachments = async (fileIDS) => {
-          let attachmentsArray = [];
+        if (!authorityOk) {
+          throw new Error('User not authorized, enable guest sending or include a token');
+        }
 
-          if (!fileIDS || fileIDS.length === 0) {
-            return attachmentsArray;
-          }
+        const getAttachments = async (fileIDs: any): Promise<any[]> => {
+          const ids = Array.isArray(fileIDs) ? fileIDs : [];
+          if (ids.length === 0) return [];
 
-          const streamAttachments = await Promise.allSettled(
-            fileIDS.map(function (id) {
-              return assetsService.getAsset(id, { transformationParams: {} });
-            })
+          const settled = await Promise.allSettled(
+            ids.map((id) => assetsService.getAsset(id, { transformationParams: {} }))
           );
 
-          const resolvedAttachments = streamAttachments.filter(
-            (attachment) => attachment.status === "fulfilled"
-          );
+          const ok = settled.filter((x) => x.status === 'fulfilled') as PromiseFulfilledResult<any>[];
 
-          resolvedAttachments.forEach((asset) => {
-            if (asset.status === "fulfilled") {
-              const { stream, file } = asset.value;
-              attachmentsArray.push({
-                contentType: file.type,
-                filename: file.filename_download,
-                content: stream,
-              });
-            }
+          return ok.map((asset) => {
+            const { stream, file } = asset.value;
+            return {
+              contentType: file.type,
+              filename: file.filename_download,
+              content: stream,
+            };
           });
-          return attachmentsArray;
         };
 
-        const createEmailObject = async (payload) => {
+        const createEmailObject = async (payload: AnyObj): Promise<MailMessage> => {
           const mail: MailMessage = {
             to: payload.to,
             subject: payload.subject,
@@ -94,14 +106,9 @@ const config: OperationApiConfig<Options> = {
             mail.html = payload.type === 'wysiwyg' ? safeBody : md(safeBody);
           }
 
-          mail.attachments = payload.attachments;
+          if (!Array.isArray(mail.attachments)) mail.attachments = [];
 
-          // Reset attachments field
-          if (mail.attachments == null) {
-            mail.attachments = new Array();
-          }
-
-          if (payload.files != null && payload.files.length > 0) {
+          if (payload.files != null && Array.isArray(payload.files) && payload.files.length > 0) {
             const fileAttachments = await getAttachments(payload.files);
             mail.attachments = mail.attachments.concat(fileAttachments);
           }
@@ -109,45 +116,32 @@ const config: OperationApiConfig<Options> = {
           return mail;
         };
 
-        const send = (email): Promise<string> => {
-          return new Promise(async (resolve, reject) => {
-            if (authorityCheck()) {
-              try {
-                await mailService.send(email);
-                resolve("sent");
-              } catch (error) {
-                console.error("MailService send error:", error);
-                reject(error);
-              }
-            } else {
-              reject(new Error("User not authorized, enable guest sending or include a token"));
-            }
-          });
-        };
-
         const emailObject = await createEmailObject(emailPayload);
-        return send(emailObject);
+        await mailService.send(emailObject);
+
+        return 'sent';
       },
     };
 
-    router.post("/", async (req, res) => {
+    router.post('/', async (req, res) => {
       const accountability = req.accountability || { user: null, role: null };
+      const token = getTokenFromHeaders(req);
+
       const context = {
         accountability,
         schema: req.schema,
         body: req.body,
+        token,
       };
+
       try {
         const result = await (globalThis as any).Emailer.sendEmail(context);
-        return res.send({ message: "Email processed successfully", status: result });
-      } catch (error) {
-        console.error("Error sending email via POST endpoint:", error);
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        const statusCode = errorMessage.includes("User not authorized") ? 401 : 500;
-        return res.status(statusCode).send({
-          message: "Failed to send email",
-          error: errorMessage,
-        });
+        return res.send({ message: 'Email processed successfully', status: result });
+      } catch (error: any) {
+        console.error('[emailer:endpoint] ERROR:', error);
+        const msg = error instanceof Error ? error.message : String(error);
+        const status = msg.includes('User not authorized') ? 401 : 500;
+        return res.status(status).send({ message: 'Failed to send email', error: msg });
       }
     });
   },
